@@ -2,8 +2,8 @@
 """Client for the culab JSON-RPC daemon running over a Jupyter terminal WS.
 
 Bootstraps culab_rpc_server.py inline (base64-embedded) into a long-lived
-JupyterHub terminal, then talks JSON to it. The terminal id is cached in
-~/.cache/culab/rpc.json and reused across invocations.
+JupyterHub terminal, then talks JSON to it. Each named client session caches
+its own terminal id under ~/.cache/culab/ and reuses it across invocations.
 
 CLI:
   culab_rpc.py ping
@@ -16,10 +16,11 @@ CLI:
   culab_rpc.py reap   JOB_ID
   culab_rpc.py push   LOCAL_PROJECT  REMOTE_PROJECT  [--exclude PATH]...
   culab_rpc.py reset                    (force new terminal + bootstrap)
+  culab_rpc.py --session codex exec "pwd"  (independent named terminal)
 
-Captcha guard: WS connections are throttled (default 0.6s between handshakes,
-override via CULAB_MIN_INTERVAL). Multi-step ops like `push` reuse a single
-WS for all RPC calls instead of one-WS-per-call.
+There is no built-in handshake rate cap. Set CULAB_MIN_INTERVAL explicitly if
+a deployment starts returning 429/5xx/captcha. Multi-step ops like `push`
+still reuse a single WS for all RPC calls instead of one-WS-per-call.
 
 Stdout for the model is intentionally minimal:
   - exec: decoded stdout to stdout, decoded stderr to stderr, exit code = remote rc
@@ -36,6 +37,7 @@ import hashlib
 import io as _io
 import json
 import os
+import re
 import shlex
 import socket
 import sys
@@ -49,9 +51,8 @@ from jupyter_terminal_exec import (
     create_terminal,
     delete_terminal,
     discover_base_path,
-    list_terminals,
     list_terminals_detailed,
-    load_cookie_items,
+    load_hub_token,
     ws_connect,
     ws_recv_text,
     ws_send_text,
@@ -59,7 +60,7 @@ from jupyter_terminal_exec import (
 
 SERVER_SCRIPT = Path(__file__).resolve().parent / "culab_rpc_server.py"
 STATE_DIR = Path.home() / ".cache" / "culab"
-STATE_FILE = STATE_DIR / "rpc.json"
+SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 # Filter for `push`: what goes into the code-only tarball.
 _EXCLUDE_PARTS = {
@@ -74,7 +75,8 @@ _EXCLUDE_SUFFIXES = {
 }
 _INCLUDE_SUFFIXES = {
     ".py", ".ipynb", ".toml", ".lock", ".md", ".txt",
-    ".yaml", ".yml", ".json", ".ini", ".cfg", ".sh",
+    ".yaml", ".yml", ".json", ".jsonl", ".ini", ".cfg", ".sh",
+    ".model",
 }
 _INCLUDE_NAMES = {".gitignore", ".dockerignore", ".python-version", "Dockerfile", "Makefile"}
 _INCLUDE_STEMS = {"Dockerfile", "Makefile"}
@@ -131,18 +133,56 @@ RESP_PREFIX = "__CULAB__"
 RESP_SUFFIX = "__END__"
 
 
+def session_name() -> str:
+    name = os.environ.get("CULAB_SESSION", "default")
+    if not SESSION_RE.fullmatch(name):
+        raise SystemExit("CULAB_SESSION: use 1-64 letters, digits, dot, underscore or dash")
+    return name
+
+
+def state_file() -> Path:
+    name = session_name()
+    return STATE_DIR / ("rpc.json" if name == "default" else f"rpc-{name}.json")
+
+
 def _state_load() -> dict:
-    if not STATE_FILE.exists():
+    path = state_file()
+    if not path.exists():
         return {}
     try:
-        return json.loads(STATE_FILE.read_text())
+        return json.loads(path.read_text())
     except Exception:
         return {}
 
 
 def _state_save(data: dict) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(data))
+    payload = dict(data)
+    payload["session"] = session_name()
+    path = state_file()
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(payload))
+    tmp.replace(path)
+
+
+def _managed_terminals() -> dict[str, str]:
+    """Map terminal id -> local session name for every state file we own."""
+    managed: dict[str, str] = {}
+    if not STATE_DIR.exists():
+        return managed
+    for path in STATE_DIR.glob("rpc*.json"):
+        try:
+            data = json.loads(path.read_text())
+        except Exception:
+            continue
+        terminal = data.get("terminal")
+        if not terminal:
+            continue
+        name = data.get("session")
+        if not name:
+            name = "default" if path.name == "rpc.json" else path.stem.removeprefix("rpc-")
+        managed[str(terminal)] = str(name)
+    return managed
 
 
 _PTY_PIECE = int(os.environ.get("CULAB_PTY_PIECE", "65536"))
@@ -221,31 +261,36 @@ def _bootstrap_command() -> str:
     )
 
 
-def _safe_delete(hub_url: str, base_path: str, items: list[dict], name: str | None) -> None:
+def _safe_delete(hub_url: str, base_path: str, token: str, name: str | None) -> None:
     if not name:
         return
     try:
-        delete_terminal(hub_url, base_path, items, name)
+        delete_terminal(hub_url, base_path, token, name)
     except Exception:
         pass
 
 
-def _connect(hub_url: str, items: list[dict]):
-    base_path = discover_base_path(items)
+def _connect(hub_url: str, token: str):
+    base_path = discover_base_path(hub_url, token)
     state = _state_load()
     terminal_name = state.get("terminal")
+    no_create = os.environ.get("CULAB_NO_CREATE", "0") == "1"
     if terminal_name:
         try:
-            sock = ws_connect(hub_url, base_path, terminal_name, items)
+            sock = ws_connect(hub_url, base_path, terminal_name, token)
             return sock, base_path, terminal_name, True
         except Exception:
+            if no_create:
+                raise
             # Saved terminal is dead. Best-effort delete it before creating
             # a replacement, so we do not leave a zombie in Jupyter UI.
-            _safe_delete(hub_url, base_path, items, terminal_name)
+            _safe_delete(hub_url, base_path, token, terminal_name)
             state.pop("terminal", None)
             _state_save(state)
-    terminal_name = create_terminal(hub_url, base_path, items)
-    sock = ws_connect(hub_url, base_path, terminal_name, items)
+    if no_create:
+        raise RuntimeError("saved terminal is required when CULAB_NO_CREATE=1")
+    terminal_name = create_terminal(hub_url, base_path, token)
+    sock = ws_connect(hub_url, base_path, terminal_name, token)
     return sock, base_path, terminal_name, False
 
 
@@ -286,8 +331,10 @@ def _is_recoverable(exc: BaseException) -> bool:
 
 
 def _throttle() -> None:
-    """Sleep so consecutive WS handshakes stay below captcha rate."""
-    min_interval = float(os.environ.get("CULAB_MIN_INTERVAL", "0.6"))
+    """Optional operator-set delay between WS handshakes; disabled by default."""
+    min_interval = float(os.environ.get("CULAB_MIN_INTERVAL", "0"))
+    if min_interval <= 0:
+        return
     state = _state_load()
     last = float(state.get("last_connect", 0.0))
     delta = time.time() - last
@@ -314,9 +361,7 @@ class RpcSession:
         self.base_path: str | None = None
         self.terminal_name: str | None = None
         self._hub_url = os.environ.get("HUB_URL", "https://jupyter.culab.ru")
-        self._items = load_cookie_items(
-            Path(os.environ.get("COOKIES_JSON", "cookies.json"))
-        )
+        self._token = load_hub_token()
 
     def __enter__(self) -> "RpcSession":
         return self
@@ -337,7 +382,7 @@ class RpcSession:
             return
         _throttle()
         self.sock, self.base_path, self.terminal_name, _reused = _connect(
-            self._hub_url, self._items
+            self._hub_url, self._token
         )
         _mark_connect()
         _ensure_daemon(self.sock, self.base_path, self.terminal_name)
@@ -362,7 +407,7 @@ class RpcSession:
                 state = _state_load()
                 stale = state.get("terminal")
                 if stale is not None and self.base_path is not None:
-                    _safe_delete(self._hub_url, self.base_path, self._items, stale)
+                    _safe_delete(self._hub_url, self.base_path, self._token, stale)
                     state.pop("terminal", None)
                     _state_save(state)
                 self.terminal_name = None
@@ -379,11 +424,11 @@ def _without_id(d: dict) -> dict:
     return {k: v for k, v in d.items() if k != "id"}
 
 
-def _hub_and_items() -> tuple[str, list[dict], str]:
+def _hub_auth() -> tuple[str, str, str]:
     hub_url = os.environ.get("HUB_URL", "https://jupyter.culab.ru")
-    items = load_cookie_items(Path(os.environ.get("COOKIES_JSON", "cookies.json")))
-    base_path = discover_base_path(items)
-    return hub_url, items, base_path
+    token = load_hub_token()
+    base_path = discover_base_path(hub_url, token)
+    return hub_url, token, base_path
 
 
 def _reset() -> dict:
@@ -396,23 +441,27 @@ def _reset() -> dict:
     saved = state.get("terminal")
     if saved is not None:
         try:
-            hub_url, items, base_path = _hub_and_items()
-            _safe_delete(hub_url, base_path, items, saved)
+            hub_url, token, base_path = _hub_auth()
+            _safe_delete(hub_url, base_path, token, saved)
         except Exception:
             pass
-    if STATE_FILE.exists():
-        STATE_FILE.unlink()
-    return {"ok": True, "removed_terminal": saved}
+    path = state_file()
+    if path.exists():
+        path.unlink()
+    return {"ok": True, "session": session_name(), "removed_terminal": saved}
 
 
 def _list_terminals() -> dict:
-    hub_url, items, base_path = _hub_and_items()
-    rows = list_terminals_detailed(hub_url, base_path, items)
+    hub_url, token, base_path = _hub_auth()
+    rows = list_terminals_detailed(hub_url, base_path, token)
     ours = _state_load().get("terminal")
+    managed = _managed_terminals()
     return {
+        "session": session_name(),
         "ours": ours,
         "terminals": [
-            {"name": r["name"], "ours": r["name"] == ours, "last_activity": r["last_activity"]}
+            {"name": r["name"], "ours": r["name"] == ours,
+             "managed_session": managed.get(r["name"]), "last_activity": r["last_activity"]}
             for r in rows
         ],
     }
@@ -425,7 +474,7 @@ def _cleanup_terminals(scope: str, name: str | None = None) -> dict:
     scope='name' deletes a single named terminal (caller's choice).
     scope='all' is rejected — too risky, would kill the user's own sessions.
     """
-    hub_url, items, base_path = _hub_and_items()
+    hub_url, token, base_path = _hub_auth()
     state = _state_load()
     if scope == "all":
         return {"error": "refused", "reason": "all would kill user terminals too; use --name or --ours"}
@@ -439,7 +488,7 @@ def _cleanup_terminals(scope: str, name: str | None = None) -> dict:
         target = name
     else:
         return {"error": "bad_scope"}
-    _safe_delete(hub_url, base_path, items, target)
+    _safe_delete(hub_url, base_path, token, target)
     if state.get("terminal") == target:
         state.pop("terminal", None)
         _state_save(state)
@@ -512,6 +561,7 @@ def _push(local_project: Path, remote_project: str, excludes: list[str]) -> dict
 
 def cli() -> int:
     p = argparse.ArgumentParser()
+    p.add_argument("--session", help="stable name for an independent reusable terminal")
     sub = p.add_subparsers(dest="op", required=True)
 
     sub.add_parser("ping")
@@ -552,6 +602,9 @@ def cli() -> int:
     p_push.add_argument("--exclude", action="append", default=[])
 
     args = p.parse_args()
+    if args.session:
+        os.environ["CULAB_SESSION"] = args.session
+    session_name()  # validate before touching local or remote state
     op = args.op
 
     if op == "reset":

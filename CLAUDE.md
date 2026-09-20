@@ -1,8 +1,11 @@
 # culab — заметка для AI-агентов
 
-Этот репозиторий — мост к JupyterHub `jupyter.culab.ru`. У тебя нет SSH и нет sudo на сервере; ты ходишь туда через WebSocket терминал, авторизуясь экспортированными браузерными cookies (`cookies.json`).
+Этот репозиторий — мост к JupyterHub `jupyter.culab.ru`. У тебя нет SSH и нет sudo на сервере; ты ходишь туда через WebSocket terminal, авторизуясь `JUPYTERHUB_TOKEN` из `~/.culab-env`.
 
 **Единственная точка входа — обёртка `./culab`.** Не дёргай `python3 jupyter_terminal_exec.py` напрямую и не пиши собственные WebSocket-вызовы — это устаревший путь, он зальёт твой контекст PTY-мусором.
+
+Параллельным агентам давай разные стабильные session names: `./culab --session codex-aamas exec "pwd"`.
+Каждая session переиспользует собственный terminal; случайное новое имя на каждый вызов не создавать.
 
 ## Когда использовать
 
@@ -29,6 +32,9 @@
 | `./culab cleanup --ours \| --name X` | `{"ok":true,"removed":[...]}` | 0 |
 | `./culab reset` | `{"ok":true,"removed_terminal":"..."}` | 0 |
 
+Глобальный `--session NAME` ставится перед командой и изолирует terminal/state. Без него используется
+session `default` — это обратная совместимость для `rig`.
+
 Обещание: stdout не содержит ANSI, prompt'ов, эха, маркеров — только то, что напечатала команда.
 
 ## Правила времени
@@ -51,7 +57,7 @@
 
 ## Чего НЕ делать
 
-1. **Не делать burst-вызовы** (`./culab status JID` в цикле без sleep). JupyterHub-фронт прячет за Yandex anti-bot — поймаешь `tmgrdfrend/showcaptcha` и придётся переэкспортировать cookies. Если опрашиваешь длинный job — `sleep 5` или больше между опросами. Throttle на 0.6с уже встроен, но это нижняя граница.
+1. Клиентского лимита частоты больше нет. Проверка 21.09.2026 прошла на 20 REST req/s, 8 одновременных terminal WS и 100 RPC ping без ошибок; это наблюдение, не SLA. При `429`, `5xx` или captcha включить backoff через `CULAB_MIN_INTERVAL`. Для обычного наблюдения чаще раза в 1–5 секунд практической пользы нет.
 2. **Никогда `./culab cleanup --all`** — этой опции нет специально. Чужие терминалы (`ours: false`) могут быть твоими собственными активными сессиями. Удаляй только по точному имени или `--ours`.
 3. **Не пиши прямые WebSocket-вызовы**, не вызывай `python3 jupyter_terminal_exec.py` руками — PTY-мусор зальёт контекст.
 4. **Не читай большие логи целиком**. Всегда `--tail` или `--grep`.
@@ -59,13 +65,13 @@
 ## Восстановление после ошибок
 
 - `RuntimeError: websocket closed` / `EOFError` — встроенный retry уже один раз отработал. Если упал снова — `./culab reset` и повтори. Возможно pod jupyterhub'a рестартанул.
-- `tmgrdfrend/showcaptcha` — поймал captcha. Скажи пользователю переэкспортировать `cookies.json` из браузера.
+- `tmgrdfrend/showcaptcha` — поймал captcha. Сделай паузу и `./culab reset`; token не проси вставлять в чат.
 - `{"error":"sha256_mismatch", ...}` в push — не должно происходить (chunks идемпотентны через `offset`). Если случилось — `./culab reset` и повтори push.
 - `unknown_job` от `status`/`log`/`kill` — демон рестартанул и забыл in-memory таблицу. Лог на диске всё ещё есть: `./culab exec "ls ~/.cache/culab-jobs/"` и `./culab exec "tail -50 ~/.cache/culab-jobs/<jid>.log"`.
 
 ## Где живёт состояние
 
-- Локально: `~/.cache/culab/rpc.json` — имя нашего сохранённого терминала + timestamp последнего connect (для throttle).
+- Локально: `~/.cache/culab/rpc.json` для `default` и `rpc-<session>.json` для именованных sessions — terminal и timestamp connect.
 - На сервере:
   - демон-процесс живёт в JupyterHub-терминале, имя в state-файле выше.
   - `~/.cache/culab-jobs/<jid>.log` — логи фоновых задач.
@@ -76,8 +82,10 @@
 | переменная | по умолчанию | для чего |
 |---|---|---|
 | `HUB_URL` | `https://jupyter.culab.ru` | endpoint JupyterHub |
-| `COOKIES_JSON` | `cookies.json` | путь к экспортированным cookies |
-| `CULAB_MIN_INTERVAL` | `0.6` | минимум секунд между WS handshakes |
+| `CULAB_ENV` | `~/.culab-env` | файл с `JUPYTERHUB_TOKEN` |
+| `JUPYTERHUB_TOKEN` | из `CULAB_ENV` | Hub REST и terminal REST/WebSocket |
+| `CULAB_SESSION` | `default` | имя независимого переиспользуемого terminal |
+| `CULAB_MIN_INTERVAL` | `0` | опциональная пауза между WS handshakes |
 | `CULAB_CHUNK` | `262144` (256 KB) | размер одного upload-чанка |
 | `CULAB_CHUNK_TIMEOUT` | `10` | таймаут на один чанк (сек) |
 | `CULAB_MAX_ATTEMPTS` | `3` | попыток на один RPC при сбое WS |
@@ -114,4 +122,4 @@ echo "$JID" > /tmp/current-job
 - `culab` — bash-обёртка над `culab_rpc.py`.
 - `culab_rpc.py` — клиент. Держит `RpcSession` (один WebSocket на серию вызовов), кэширует имя терминала в `~/.cache/culab/rpc.json`, делает throttle, retry, авто-cleanup мёртвых терминалов. Логика фильтра push (`_should_include`, `_make_tarball`) тоже здесь.
 - `culab_rpc_server.py` — серверный демон. Загружается inline через `exec python3 -c "exec(b64decode(...))"`; никаких файлов на сервере не создаётся для bootstrap.
-- `jupyter_terminal_exec.py` — низкоуровневый WS-handshake, cookie-auth, framing. Не дёргай напрямую.
+- `jupyter_terminal_exec.py` — низкоуровневый token-auth WS-handshake и framing. Не дёргай напрямую.
